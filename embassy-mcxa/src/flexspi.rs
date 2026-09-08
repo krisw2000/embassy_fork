@@ -50,6 +50,9 @@ const IRQ_EVENT_COMMAND_DONE: u32 = 1 << 0;
 const IRQ_EVENT_COMMAND_GRANT: u32 = 1 << 1;
 const IRQ_EVENT_COMMAND_ERROR: u32 = 1 << 2;
 const IRQ_EVENT_TX_WATERMARK: u32 = 1 << 3;
+const FLASH_SLOT_SIZE_KBYTES: u32 = 64 * 1024;
+const FLASH_SLOT_SIZE_BYTES: u32 = FLASH_SLOT_SIZE_KBYTES * 1024;
+const JEDEC_ID_SIZE: usize = 3;
 
 pub mod lookup {
     const INSTRUCTIONS_PER_SEQUENCE: usize = 8;
@@ -410,12 +413,12 @@ macro_rules! impl_flexspi_cs_pin {
     };
     ($pin:ident, $peri:ident, Ss0, B) => {
         impl crate::flexspi::SsPin<crate::peripherals::$peri, crate::flexspi::B> for crate::peripherals::$pin {
-            const CHIP_INDEX: u8 = 1;
+            const CHIP_INDEX: u8 = 2;
         }
     };
     ($pin:ident, $peri:ident, Ss1, A) => {
         impl crate::flexspi::SsPin<crate::peripherals::$peri, crate::flexspi::A> for crate::peripherals::$pin {
-            const CHIP_INDEX: u8 = 2;
+            const CHIP_INDEX: u8 = 1;
         }
     };
     ($pin:ident, $peri:ident, Ss1, B) => {
@@ -533,6 +536,21 @@ struct DmaState<'d> {
     rx_dma: DmaChannel<'d>,
 }
 
+#[derive(Clone, Copy)]
+enum ReadSampleClock {
+    InternalLoopback,
+    DqsPadLoopback,
+}
+
+impl ReadSampleClock {
+    fn register_value(self) -> pac::flexspi::Rxclksrc {
+        match self {
+            Self::InternalLoopback => pac::flexspi::Rxclksrc::Val0,
+            Self::DqsPadLoopback => pac::flexspi::Rxclksrc::Val1,
+        }
+    }
+}
+
 pub struct Blocking;
 pub struct Async;
 pub trait Mode {
@@ -550,6 +568,7 @@ struct InnerFlexSpi<'d, M: Mode> {
     dma: Option<DmaState<'d>>,
     /// The index of the chip we're set up to use. The current impl only supports 1 chip at a time
     chip_index: u8,
+    ip_address_offset: u32,
     flash: FlashConfig,
     _wg: Option<WakeGuard>,
     _phantom: PhantomData<M>,
@@ -561,6 +580,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         dma: Option<DmaState<'d>>,
         clock: ClockConfig,
         chip_index: u8,
+        read_sample_clock: ReadSampleClock,
         flash: FlashConfig,
     ) -> Result<Self, SetupError> {
         if flash.page_size == 0 || flash.page_size > MAX_PAGE_SIZE {
@@ -587,12 +607,13 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             info: T::info(),
             dma,
             chip_index,
+            ip_address_offset: chip_index as u32 * FLASH_SLOT_SIZE_BYTES,
             flash,
             _wg: parts.wake_guard,
             _phantom: PhantomData,
         };
 
-        flash_driver.initialize()?;
+        flash_driver.initialize(read_sample_clock)?;
 
         if M::INTERRUPTS_ENABLED {
             T::Interrupt::unpend();
@@ -619,17 +640,17 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         Ok(0)
     }
 
-    fn initialize(&mut self) -> Result<(), SetupError> {
-        self.configure_controller();
+    fn initialize(&mut self, read_sample_clock: ReadSampleClock) -> Result<(), SetupError> {
+        self.configure_controller(read_sample_clock);
         self.flash_reset()?;
         self.apply_device_mode()?;
         Ok(())
     }
 
-    fn configure_controller(&mut self) {
+    fn configure_controller(&mut self, read_sample_clock: ReadSampleClock) {
         self.info.regs.mcr0().write(|r: &mut Mcr0| {
             r.set_mdis(pac::flexspi::Mdis::Val0);
-            r.set_rxclksrc(pac::flexspi::Rxclksrc::Val1);
+            r.set_rxclksrc(read_sample_clock.register_value());
             // Match the SDK's arbitration / low-power defaults. IPGRANTWAIT and
             // AHBGRANTWAIT bound how many (1024-serial-clock) cycles an IP- or
             // AHB-triggered command waits for the sequence-engine grant before a
@@ -665,6 +686,12 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
             r.set_priority(0);
             r.set_prefetchen(pac::flexspi::Ahbrxbuf0cr0Prefetchen::Value1);
         });
+        for index in 0..self.chip_index as usize {
+            self.info
+                .regs
+                .flshcr0(index)
+                .write(|r: &mut Flshcr0| r.set_flshsz(FLASH_SLOT_SIZE_KBYTES));
+        }
         self.info
             .regs
             .flshcr0(self.chip_index as usize)
@@ -709,7 +736,7 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.info.regs.iprxfcr().modify(|r: &mut Iprxfcr| r.set_rxwmrk(0));
 
         // Read-strobe (sample clock) delay line. For the loopback RXCLKSRC modes
-        // this driver uses (RXCLKSRC = loopback-from-DQS-pad), the SDK programs
+        // this driver uses, the SDK programs
         // DLLCR to FLEXSPI_DLLCR_DEFAULT == OVRDEN=1, OVRDVAL=0 -- a fixed,
         // minimal delay -- regardless of the serial clock; only the
         // external-DQS path uses the frequency-dependent DLL. The reset value 0
@@ -775,6 +802,12 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
         self.extract_vendor_id()
     }
 
+    pub fn read_jedec_id(&mut self) -> Result<[u8; JEDEC_ID_SIZE], IoError> {
+        let mut id = [0; JEDEC_ID_SIZE];
+        self.issue_ip_read_command(0, self.flash.read_id_seq as usize, &mut id)?;
+        Ok(id)
+    }
+
     pub fn erase_sector(&mut self, address: u32) -> Result<(), IoError> {
         self.check_in_bounds(address, 1)?;
         self.write_enable()?;
@@ -817,6 +850,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     /// Total addressable flash size in bytes.
     fn flash_size_bytes(&self) -> u64 {
         self.flash.flash_size_kbytes as u64 * 1024
+    }
+
+    fn ip_address(&self, address: u32) -> u32 {
+        self.ip_address_offset + address
     }
 
     /// Reject a read/erase access that runs past the end of the device.
@@ -961,7 +998,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_size);
             r.set_iseqid(seq_index as u8);
@@ -985,7 +1025,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     fn issue_ip_write_command(&mut self, address: u32, seq_index: usize, data: &[u8]) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1024,7 +1067,10 @@ impl<'d, M: Mode> InnerFlexSpi<'d, M> {
     fn issue_ip_read_command(&mut self, address: u32, seq_index: usize, buffer: &mut [u8]) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(buffer.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1073,6 +1119,13 @@ impl<'d> InnerFlexSpi<'d, Async> {
             .await?;
 
         self.extract_vendor_id()
+    }
+
+    pub async fn read_jedec_id_async(&mut self) -> Result<[u8; JEDEC_ID_SIZE], IoError> {
+        let mut id = [0; JEDEC_ID_SIZE];
+        self.issue_ip_read_command_async(0, self.flash.read_id_seq as usize, &mut id)
+            .await?;
+        Ok(id)
     }
 
     pub async fn erase_sector_async(&mut self, address: u32) -> Result<(), IoError> {
@@ -1189,7 +1242,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_size);
             r.set_iseqid(seq_index as u8);
@@ -1216,7 +1272,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1259,7 +1318,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
     ) -> Result<(), IoError> {
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(buffer.len() as u16);
             r.set_iseqid(seq_index as u8);
@@ -1294,7 +1356,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
 
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_len as u16);
             r.set_iseqid(seq_index as u8);
@@ -1342,7 +1407,10 @@ impl<'d> InnerFlexSpi<'d, Async> {
 
         self.prepare_ip_transfer();
 
-        self.info.regs.ipcr0().write(|r: &mut Ipcr0| r.set_sfar(address));
+        self.info
+            .regs
+            .ipcr0()
+            .write(|r: &mut Ipcr0| r.set_sfar(self.ip_address(address)));
         self.info.regs.ipcr1().write(|r: &mut Ipcr1| {
             r.set_idatsz(data_len as u16);
             r.set_iseqid(seq_index as u8);
@@ -1489,7 +1557,45 @@ impl<'d> Flexspi<'d, Blocking> {
         data3.mux();
 
         Ok(Self {
-            inner: InnerFlexSpi::new_inner(peri, None, clock, ss.chip_index(), flash)?,
+            inner: InnerFlexSpi::new_inner(
+                peri,
+                None,
+                clock,
+                ss.chip_index(),
+                ReadSampleClock::DqsPadLoopback,
+                flash,
+            )?,
+        })
+    }
+
+    /// Creates a blocking FlexSPI driver using the internal receive-clock loopback.
+    pub fn new_blocking_without_dqs<T: Instance, P: Port>(
+        peri: Peri<'d, T>,
+        ss: Peri<'d, impl SsPin<T, P> + 'd>,
+        sclk: Peri<'d, impl SclkPin<T, P> + 'd>,
+        data0: Peri<'d, impl Data0Pin<T, P> + 'd>,
+        data1: Peri<'d, impl Data1Pin<T, P> + 'd>,
+        data2: Peri<'d, impl Data2Pin<T, P> + 'd>,
+        data3: Peri<'d, impl Data3Pin<T, P> + 'd>,
+        clock: ClockConfig,
+        flash: FlashConfig,
+    ) -> Result<Self, SetupError> {
+        ss.mux();
+        sclk.mux();
+        data0.mux();
+        data1.mux();
+        data2.mux();
+        data3.mux();
+
+        Ok(Self {
+            inner: InnerFlexSpi::new_inner(
+                peri,
+                None,
+                clock,
+                ss.chip_index(),
+                ReadSampleClock::InternalLoopback,
+                flash,
+            )?,
         })
     }
 }
@@ -1517,7 +1623,46 @@ impl<'d> Flexspi<'d, Async> {
         data3.mux();
 
         Ok(Self {
-            inner: InnerFlexSpi::new_inner(peri, None, clock, ss.chip_index(), flash)?,
+            inner: InnerFlexSpi::new_inner(
+                peri,
+                None,
+                clock,
+                ss.chip_index(),
+                ReadSampleClock::DqsPadLoopback,
+                flash,
+            )?,
+        })
+    }
+
+    /// Creates an interrupt-driven FlexSPI driver using the internal receive-clock loopback.
+    pub fn new_async_without_dqs<T: Instance, P: Port>(
+        peri: Peri<'d, T>,
+        ss: Peri<'d, impl SsPin<T, P> + 'd>,
+        sclk: Peri<'d, impl SclkPin<T, P> + 'd>,
+        data0: Peri<'d, impl Data0Pin<T, P> + 'd>,
+        data1: Peri<'d, impl Data1Pin<T, P> + 'd>,
+        data2: Peri<'d, impl Data2Pin<T, P> + 'd>,
+        data3: Peri<'d, impl Data3Pin<T, P> + 'd>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        clock: ClockConfig,
+        flash: FlashConfig,
+    ) -> Result<Self, SetupError> {
+        ss.mux();
+        sclk.mux();
+        data0.mux();
+        data1.mux();
+        data2.mux();
+        data3.mux();
+
+        Ok(Self {
+            inner: InnerFlexSpi::new_inner(
+                peri,
+                None,
+                clock,
+                ss.chip_index(),
+                ReadSampleClock::InternalLoopback,
+                flash,
+            )?,
         })
     }
 
@@ -1553,6 +1698,44 @@ impl<'d> Flexspi<'d, Async> {
                 }),
                 clock,
                 ss.chip_index(),
+                ReadSampleClock::DqsPadLoopback,
+                flash,
+            )?,
+        })
+    }
+
+    /// Creates a DMA-backed FlexSPI driver using the internal receive-clock loopback.
+    pub fn new_with_dma_without_dqs<T: Instance, P: Port>(
+        peri: Peri<'d, T>,
+        ss: Peri<'d, impl SsPin<T, P> + 'd>,
+        sclk: Peri<'d, impl SclkPin<T, P> + 'd>,
+        data0: Peri<'d, impl Data0Pin<T, P> + 'd>,
+        data1: Peri<'d, impl Data1Pin<T, P> + 'd>,
+        data2: Peri<'d, impl Data2Pin<T, P> + 'd>,
+        data3: Peri<'d, impl Data3Pin<T, P> + 'd>,
+        tx_dma: Peri<'d, impl Channel>,
+        rx_dma: Peri<'d, impl Channel>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        clock: ClockConfig,
+        flash: FlashConfig,
+    ) -> Result<Self, SetupError> {
+        ss.mux();
+        sclk.mux();
+        data0.mux();
+        data1.mux();
+        data2.mux();
+        data3.mux();
+
+        Ok(Self {
+            inner: InnerFlexSpi::new_inner(
+                peri,
+                Some(DmaState {
+                    tx_dma: DmaChannel::new(tx_dma),
+                    rx_dma: DmaChannel::new(rx_dma),
+                }),
+                clock,
+                ss.chip_index(),
+                ReadSampleClock::InternalLoopback,
                 flash,
             )?,
         })
@@ -1576,6 +1759,10 @@ impl<'d, M: Mode> NorFlash<'d, M> {
         self.flexspi.inner.read_vendor_id()
     }
 
+    pub fn blocking_jedec_id(&mut self) -> Result<[u8; JEDEC_ID_SIZE], IoError> {
+        self.flexspi.inner.read_jedec_id()
+    }
+
     pub fn blocking_erase_sector(&mut self, address: u32) -> Result<(), IoError> {
         self.flexspi.inner.erase_sector(address)
     }
@@ -1592,6 +1779,10 @@ impl<'d, M: Mode> NorFlash<'d, M> {
 impl<'d> NorFlash<'d, Async> {
     pub async fn read_vendor_id_async(&mut self) -> Result<u8, IoError> {
         self.flexspi.inner.read_vendor_id_async().await
+    }
+
+    pub async fn read_jedec_id_async(&mut self) -> Result<[u8; JEDEC_ID_SIZE], IoError> {
+        self.flexspi.inner.read_jedec_id_async().await
     }
 
     pub async fn erase_sector_async(&mut self, address: u32) -> Result<(), IoError> {
